@@ -1,150 +1,187 @@
 import socket
 import threading
+import sys
+# O Lock para sincronismo é mantido
+lock_recursos = threading.Lock() 
 
 # --- Configurações do Servidor ---
-HOST = '0.0.0.0'  # Aceita conexões de qualquer interface de rede
-PORT = 55555      # Porta escolhida para o chat (pode ser 6667 ou outra livre)
+HOST = '0.0.0.0'
+PORT = 55555
 
-# Listas globais para armazenar os clientes conectados e seus respectivos nomes
+# --- Variáveis Globais (Recursos Compartilhados) ---
 clientes = []
 nomes_usuarios = []
 
-# --- Funções do Servidor ---
+
+# --- Funções Auxiliares de Resposta ---
+
+def enviar_resposta(cliente, status_code, status_text, corpo=""):
+    """
+    Formata e envia uma resposta no formato HTTP simplificado.
+    Ex: '200 OK\nMensagem de Status\nCorpo da Mensagem'
+    """
+    resposta = f"{status_code} {status_text}\n{corpo}"
+    try:
+        cliente.send(resposta.encode('utf-8'))
+    except:
+        remover_cliente(cliente) # Se falhar, remove o cliente
 
 def broadcast(mensagem, cliente_excecao=None):
     """
-    Envia uma mensagem (em bytes) para todos os clientes,
-    opcionalmente excluindo um cliente específico (o remetente).
+    Envia uma mensagem de chat (sem código HTTP) para todos os clientes, exceto o remetente.
     """
-    for cliente in clientes:
+    # ... (código mantido, pois é uma funcionalidade interna do chat)
+    lock_recursos.acquire()
+    clientes_copia = list(clientes)
+    lock_recursos.release()
+    
+    for cliente in clientes_copia:
         if cliente != cliente_excecao:
             try:
-                # O servidor envia a mensagem já formatada (string -> bytes)
+                # O servidor envia o conteúdo da mensagem de chat (não a resposta HTTP)
                 cliente.send(mensagem)
             except:
-                # Se houver erro ao enviar, remove o cliente (provavelmente desconectou)
                 remover_cliente(cliente)
 
 def remover_cliente(cliente):
     """
-    Remove um cliente das listas e notifica a todos sobre a saída.
+    Remove um cliente das listas com acesso protegido por Lock.
     """
-    if cliente in clientes:
-        # Encontra o índice do cliente para obter o nickname
-        index = clientes.index(cliente)
-        nickname = nomes_usuarios[index]
-        
-        # Remove das listas
-        clientes.remove(cliente)
-        nomes_usuarios.remove(nickname)
-        
-        # Fecha o socket
-        cliente.close()
-        
-        # Notifica a todos
-        saida_msg = f"[{nickname}] saiu do chat."
-        print(saida_msg)
-        broadcast(saida_msg.encode('utf-8'))
+    lock_recursos.acquire()
+    try:
+        if cliente in clientes:
+            index = clientes.index(cliente)
+            nickname = nomes_usuarios[index]
+            
+            clientes.remove(cliente)
+            nomes_usuarios.remove(nickname)
+            cliente.close()
+            
+            saida_msg = f"[{nickname}] saiu do chat."
+            print(saida_msg)
+            broadcast(saida_msg.encode('utf-8'))
+            
+    finally:
+        lock_recursos.release()
 
+# --- Funções de Requisição (Análise do Protocolo de Chat) ---
+
+def processar_requisicao(cliente, nickname, requisicao):
+    """
+    Analisa a requisição do cliente e responde com um código HTTP.
+    Formato esperado: COMANDO [Argumentos]
+    """
+    partes = requisicao.split(' ', 1)
+    comando = partes[0].upper()
+    argumento = partes[1] if len(partes) > 1 else ""
+
+    if comando == 'MSG':
+        # Comando MSG <mensagem>
+        if argumento:
+            mensagem_chat = f"[{nickname}]: {argumento}"
+            print(f"[MSG] {mensagem_chat}")
+            broadcast(mensagem_chat.encode('utf-8'), cliente)
+            # Resposta ao cliente: 200 OK
+            enviar_resposta(cliente, "200", "OK", "Mensagem enviada com sucesso.")
+        else:
+            # Resposta ao cliente: 400 Bad Request
+            enviar_resposta(cliente, "400", "Bad Request", "Formato: MSG <mensagem>")
+            
+    elif comando == 'LIST':
+        # Comando LIST (Lista de usuários)
+        lock_recursos.acquire()
+        lista_usuarios = ", ".join(nomes_usuarios)
+        lock_recursos.release()
+        
+        # Resposta ao cliente: 200 OK
+        enviar_resposta(cliente, "200", "OK - User List", f"Usuários online: {lista_usuarios}")
+
+    elif comando == 'QUIT':
+        # Comando QUIT
+        enviar_resposta(cliente, "200", "OK - Disconnecting", "Sessão encerrada.")
+        return True # Sinaliza para o handler desconectar
+    
+    else:
+        # Resposta ao cliente: 404 Not Found
+        enviar_resposta(cliente, "404", "Not Found", f"Comando desconhecido: {comando}")
+        
+    return False # Não desconectar
 
 def handle_client(cliente):
     """
-    Função executada em uma thread separada para cada cliente.
-    Gerencia a autenticação e a recepção contínua de mensagens.
+    Gerencia a autenticação e o loop de requisições/respostas.
     """
-    
-    # 1. Autenticação do Nickname
+    nickname = ""
+    # ... (Lógica de Autenticação NICK e adição à lista - mantida com Lock)
     try:
-        # Envia a solicitação de NICK para o cliente
         cliente.send('NICK'.encode('utf-8'))
+        nickname_bruto = cliente.recv(1024).decode('utf-8')
         
-        # Recebe o nickname (máximo 1024 bytes)
-        nickname = cliente.recv(1024).decode('utf-8')
+        # O cliente envia o nickname, que é tratado como uma 'requisição' inicial.
+        nickname = nickname_bruto.split(' ', 1)[0] # Pega apenas a primeira palavra
         
-        # Adiciona às listas globais
-        nomes_usuarios.append(nickname)
+        lock_recursos.acquire()
+        try:
+            nomes_usuarios.append(nickname)
+        finally:
+            lock_recursos.release()
+            
+        entrada_msg = f"{nickname} entrou no chat!"
+        print(f"[NOVO] {entrada_msg}")
+        broadcast(entrada_msg.encode('utf-8'), cliente)
         
+        # Confirmação de conexão com código 200
+        enviar_resposta(cliente, "200", "OK - Connected", f"Bem-vindo(a), {nickname}.")
+
     except:
-        # Se não conseguir obter o nickname, remove e encerra a thread
         remover_cliente(cliente)
         return
 
-    # Notificação de entrada
-    entrada_msg = f"{nickname} entrou no chat!"
-    print(f"[NOVO] {entrada_msg}")
-    broadcast(entrada_msg.encode('utf-8'), cliente) # Notifica a todos, exceto ao próprio recém-chegado
-
-    # 2. Loop principal de mensagens
+    # Loop principal de requisições
     while True:
         try:
-            # Recebe a mensagem do cliente
-            mensagem = cliente.recv(1024)
+            requisicao = cliente.recv(1024).decode('utf-8').strip()
             
-            if not mensagem: 
-                # Se não há mensagem, o cliente desconectou
+            if not requisicao:
                 break 
-            
-            # Decodifica e formata a mensagem
-            mensagem_decodificada = mensagem.decode('utf-8')
 
-            # Tratar comandos do cliente, se houver (ex: /quit)
-            if mensagem_decodificada.lower() == '/quit':
-                break
+            if processar_requisicao(cliente, nickname, requisicao):
+                break # Se processar_requisicao retornar True (QUIT)
 
-            # Mensagem para o chat
-            mensagem_formatada = f"[{nickname}]: {mensagem_decodificada}"
-            print(f"[MSG] {mensagem_formatada}")
-            
-            # Faz o broadcast (o servidor envia a mensagem formatada para todos os outros)
-            broadcast(mensagem_formatada.encode('utf-8'), cliente)
-            
         except:
-            # Quebra do loop em caso de erro de conexão
             break
 
-    # 3. Tratamento de desconexão
     remover_cliente(cliente)
 
+# ... (restante do código iniciar_servidor() mantido com Lock)
 
 def iniciar_servidor():
-    """
-    Configura e inicia o socket do servidor para aceitar conexões.
-    """
-    
-    # Cria o socket TCP
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
-    # Faz o bind no host e porta
     try:
         servidor.bind((HOST, PORT))
+        servidor.listen()
     except Exception as e:
-        print(f"Erro ao fazer bind: {e}")
+        print(f"Erro ao iniciar o servidor: {e}")
         return
 
-    # Entra no modo de escuta
-    servidor.listen()
-    
-    print(f"=============================================")
-    print(f" Servidor IRC Simplificado rodando em {HOST}:{PORT}")
-    print(f" Aguardando conexões...")
-    print(f"=============================================")
+    print(f" Servidor IRC Simplificado (HTTP-like) rodando em {HOST}:{PORT}")
 
-    # Loop de aceitação de clientes
     while True:
         try:
-            # Espera e aceita uma nova conexão
             cliente, endereco = servidor.accept()
             print(f"\n[INFO] Nova conexão de {endereco[0]}:{endereco[1]}")
             
-            # Adiciona o novo cliente à lista ANTES da thread (para evitar race conditions)
-            clientes.append(cliente) 
+            lock_recursos.acquire()
+            try:
+                clientes.append(cliente) 
+            finally:
+                lock_recursos.release()
             
-            # Inicia uma thread para manipular a comunicação com o novo cliente
             thread = threading.Thread(target=handle_client, args=(cliente,))
             thread.start()
             
         except KeyboardInterrupt:
-            # Permite interromper o servidor com Ctrl+C
             print("\nServidor encerrado pelo usuário.")
             servidor.close()
             break
@@ -152,6 +189,5 @@ def iniciar_servidor():
             print(f"\nErro no loop principal do servidor: {e}")
             break
 
-# --- Chamada Principal ---
 if __name__ == '__main__':
     iniciar_servidor()

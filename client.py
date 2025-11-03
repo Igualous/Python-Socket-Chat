@@ -3,52 +3,71 @@ import threading
 import sys
 
 # --- Configurações do Cliente ---
-# Se o servidor estiver rodando na mesma máquina, use 127.0.0.1
-HOST = '192.168.0.88' # <----  ENDEREÇO IP DA MÁQUINA QUE RODA O SERVIDOR
-PORT = 55555      # Deve ser a mesma porta configurada no server.py
+HOST = '192.168.0.88' 
+PORT = 55555      
 
-# Variáveis globais
 cliente_socket = None
 nickname = ""
 
+# Cores ANSI para o terminal (opcional, mas ajuda a visualizar o status)
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+ENDC = '\033[0m' # Reset de cor
+
 # --- Funções do Cliente ---
+
+def formatar_resposta(mensagem_bruta):
+    """
+    Processa a mensagem bruta do servidor, separando o código de status.
+    """
+    partes = mensagem_bruta.split('\n', 1)
+    
+    # 1. Tenta extrair o código de status da primeira linha
+    primeira_linha = partes[0]
+    if primeira_linha.startswith(('200', '400', '404')):
+        # É uma resposta de status do protocolo
+        status = primeira_linha
+        corpo = partes[1] if len(partes) > 1 else ""
+        
+        if status.startswith('200'):
+            return f"{GREEN}[200 OK]{ENDC} {status.split(' ', 1)[1]}: {corpo}"
+        elif status.startswith('404'):
+            return f"{RED}[404 Not Found]{ENDC} {corpo}"
+        elif status.startswith('400'):
+            return f"{YELLOW}[400 Bad Request]{ENDC} {corpo}"
+        else:
+            # Caso não seja uma das esperadas
+            return f"{YELLOW}[STATUS]{ENDC} {mensagem_bruta}"
+    
+    # 2. Se não começar com código, é uma mensagem de chat de BROADCAST
+    return mensagem_bruta
 
 def receive_messages():
     """
-    Função rodando em uma thread separada para receber e exibir
-    mensagens do servidor no terminal.
+    Thread de recepção, agora formatando as respostas HTTP.
     """
+    global nickname
     while True:
         try:
-            # Tenta receber dados do servidor
             mensagem = cliente_socket.recv(1024).decode('utf-8')
             
-            if not mensagem:
-                # Se não receber dados, o servidor provavelmente fechou a conexão
+            if not mensagem: 
                 print("\n[ERRO] Conexão perdida com o servidor. Fechando...")
                 cliente_socket.close()
-                sys.exit(0) # Encerra o programa
+                sys.exit(0)
             
             if mensagem == 'NICK':
-                # Mensagem especial do servidor solicitando o nickname
-                # O servidor espera a resposta para este comando
+                # No NICK, o cliente envia apenas a palavra (o servidor trata como 'requisição')
                 cliente_socket.send(nickname.encode('utf-8'))
                 
             else:
-                # Mensagem normal do chat: imprime no terminal
-                # sys.stdout.write e flush são usados para garantir que a mensagem 
-                # seja impressa imediatamente e não interfira na linha de 'input'
-                sys.stdout.write(f"\n{mensagem}\n> ")
+                mensagem_formatada = formatar_resposta(mensagem)
+                sys.stdout.write(f"\n{mensagem_formatada}\n> ")
                 sys.stdout.flush() 
 
-        except ConnectionResetError:
-            # Tratamento específico para quando o servidor é abruptamente fechado
-            print("\n[ERRO] Conexão redefinida pelo host (servidor fechou).")
-            cliente_socket.close()
-            sys.exit(0)
         except Exception as e:
-            # Tratamento genérico de outros erros de conexão
-            print(f"\n[ERRO] Ocorreu um erro na recepção: {e}")
+            # print(f"[ERRO na recepção]: {e}") # Debug
             cliente_socket.close()
             sys.exit(0)
             
@@ -56,33 +75,38 @@ def receive_messages():
 
 def write_messages():
     """
-    Função rodando na thread principal para ler a entrada do usuário
-    e enviar as mensagens para o servidor.
+    Thread de escrita, enviando comandos no formato de protocolo.
     """
     global cliente_socket
     while True:
         try:
-            # Solicita a entrada do usuário, apresentando um prompt
-            mensagem = input('> ')
+            entrada_bruta = input('> ')
             
-            # --- Tratamento de comandos locais (opcional) ---
-            if mensagem.lower() == '/quit':
-                print("[SAÍDA] Desconectando do servidor...")
-                cliente_socket.send(mensagem.encode('utf-8')) # Informa o servidor
-                cliente_socket.close()
-                sys.exit(0)
+            # Padroniza para comandos MAIÚSCULOS
+            entrada_processada = entrada_bruta.strip()
             
-            # Envia a mensagem para o servidor
-            cliente_socket.send(mensagem.encode('utf-8'))
+            # --- Tratamento de comandos locais e envio ---
+            if entrada_processada.lower() == '/quit':
+                comando_envio = "QUIT"
+            elif entrada_processada.lower().startswith('/list'):
+                 comando_envio = "LIST"
+            elif entrada_processada.startswith('/'):
+                # Qualquer outro comando com barra ('/') é um erro de sintaxe
+                 comando_envio = entrada_processada[1:].upper()
+            else:
+                # Se não tem barra, é uma mensagem de chat padrão
+                comando_envio = f"MSG {entrada_processada}" 
             
+            cliente_socket.send(comando_envio.encode('utf-8'))
+            
+            if comando_envio == "QUIT":
+                sys.exit(0) # Encerra após enviar o QUIT
+
         except EOFError:
-            # Tratamento para Ctrl+D (fim do arquivo) no Linux/Mac
-            print("\n[SAÍDA] Desconectando por EOF.")
-            cliente_socket.close()
-            break
+            cliente_socket.send("QUIT".encode('utf-8'))
+            sys.exit(0)
         except Exception as e:
-            # Se o socket fechar enquanto tenta enviar
-            print(f"[ERRO] Falha ao enviar a mensagem. Desconectando...")
+            # print(f"[ERRO no envio]: {e}") # Debug
             break
 
 
@@ -93,36 +117,24 @@ def iniciar_cliente():
     global cliente_socket
     global nickname
     
-    # 1. Obter Nickname
     while not nickname:
         nickname = input("Escolha seu nickname (não pode ser vazio): ")
     
-    # 2. Configurar Socket e Conexão
     try:
         cliente_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         cliente_socket.connect((HOST, PORT))
         
-        print(f"=============================================")
-        print(f" Conectado ao servidor IRC em {HOST}:{PORT}")
-        print(f" Digite '/quit' para sair. Mensagens:\n")
+        print(f" Conectado ao servidor IRC (HTTP-like) em {HOST}:{PORT}")
         
-    except ConnectionRefusedError:
-        print(f"[ERRO] Conexão recusada. Verifique se o servidor está ativo em {HOST}:{PORT}.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERRO] Ocorreu um erro na conexão: {e}")
+    except Exception:
+        print(f"[ERRO] Falha ao conectar. Verifique o servidor e o IP/Porta.")
         sys.exit(1)
 
-    # 3. Iniciar Threads
-    
-    # Thread de Recepção: Roda em segundo plano para ouvir o servidor
     receive_thread = threading.Thread(target=receive_messages)
-    receive_thread.daemon = True # Define como daemon para fechar automaticamente com o programa principal
+    receive_thread.daemon = True 
     receive_thread.start()
 
-    # Thread de Escrita: Roda na thread principal (para manter o 'input')
     write_messages()
     
-# --- Chamada Principal ---
 if __name__ == '__main__':
     iniciar_cliente()
